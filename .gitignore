@@ -1,0 +1,6 @@
+
+# Auto-generated cluster info — contains real cluster URLs and IPs
+cluster-info.json
+
+# Raw learning journals — contain sensitive cluster data
+gitops/learnings/*.raw.yaml
