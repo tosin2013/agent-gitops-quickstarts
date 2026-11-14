@@ -184,6 +184,8 @@ $ ./gitops/skills/install-skills.sh --list
 | `deploy-profile` | Deploy a full cluster profile via ArgoCD |
 | `troubleshoot-argocd` | Diagnose and fix ArgoCD sync failures |
 | `configure-lab-environment` | Configure infra nodes + local storage + ODF + profile on any multi-node cluster |
+| `create-kustomize-operator` | Scaffold a new operator (base + overlays + ArgoCD Application YAML) |
+| `manage-argocd-apps` | Create and manage ArgoCD Applications, sync waves, app-of-apps profiles |
 
 ## Do NOT
 

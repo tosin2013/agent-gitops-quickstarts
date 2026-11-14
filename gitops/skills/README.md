@@ -4,7 +4,7 @@ This directory contains AI skill definitions for Day 2 OpenShift configuration.
 Skills are structured instruction files that tell an AI agent (Claude Code, etc.)
 how to perform a specific GitOps operation on a live cluster, step by step.
 
-## Available Skills (9 total)
+## Available Skills (11 total)
 
 ```bash
 ./install-skills.sh --list
@@ -21,6 +21,8 @@ how to perform a specific GitOps operation on a live cluster, step by step.
 | [`deploy-profile`](deploy-profile/SKILL.md) | "deploy profile", "configure cluster" | Deploys a full ArgoCD cluster profile |
 | [`troubleshoot-argocd`](troubleshoot-argocd/SKILL.md) | "ArgoCD not syncing", "sync failed" | Diagnoses and fixes ArgoCD sync failures |
 | [`configure-lab-environment`](configure-lab-environment/SKILL.md) | "configure lab", "KVM cluster setup" | Full multi-node setup: infra nodes + LSO + ODF + profile |
+| [`create-kustomize-operator`](create-kustomize-operator/SKILL.md) | "add a new operator", "create kustomize overlay" | Scaffold a new operator into the repo (base + overlays + ArgoCD App) |
+| [`manage-argocd-apps`](manage-argocd-apps/SKILL.md) | "create ArgoCD application", "app-of-apps", "sync wave" | Create and manage ArgoCD Applications and profiles |
 
 ## Quick Start
 
@@ -60,6 +62,12 @@ This pulls Day-2 relevant agentic skills from:
 - `openshift/agentic-skills` — cluster-troubleshoot, cluster-update, gitops
 - `RHEcosystemAppEng/agentic-plugins` — ocp-admin/*
 - `redhat-developer/agentic-skills` — Argo CD skills
+
+## Related Documentation
+
+- [`docs/kustomize-argocd-patterns.md`](../../docs/kustomize-argocd-patterns.md) — full reference for base/overlay, sync waves, prune decisions
+- [`docs/gitops-catalog.md`](../../docs/gitops-catalog.md) — how to use gitops-catalog as a starting point for new operators
+- [`CONTRIBUTING_SKILLS.md`](CONTRIBUTING_SKILLS.md) — how to write a new skill
 
 ## Skill Execution Order (Dependency Chain)
 

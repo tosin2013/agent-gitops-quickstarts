@@ -15,6 +15,8 @@ SKILLS=(
   deploy-profile
   troubleshoot-argocd
   configure-lab-environment
+  create-kustomize-operator
+  manage-argocd-apps
 )
 
 usage() {

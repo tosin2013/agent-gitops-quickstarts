@@ -377,6 +377,38 @@ Operators that have dependencies use `argocd.argoproj.io/sync-wave` annotations:
 - Wave 3: Instances (StorageCluster, HyperConverged, etc.)
 - Wave 4+: Applications/workloads that depend on storage/virt
 
+## gitops-catalog — Community Operator Reference
+
+When adding a new operator, check the community gitops-catalog first:
+
+| Repo | Description |
+|---|---|
+| `redhat-cop/gitops-catalog` | Upstream: 90+ operators in base/overlay Kustomize format |
+| `tosin2013/gitops-catalog` | Fork with `scripts/automate_operators.sh` and pre-dumped `operator_info.txt` |
+
+Both follow the same base/overlay pattern as this repo. Copy the operator config locally
+(don't use remote Kustomize references in production) then add platform/version overlays.
+
+```bash
+git clone --depth=1 https://github.com/tosin2013/gitops-catalog.git /tmp/catalog
+ls /tmp/catalog | grep -i <operator>        # check if it's already there
+grep -A10 "<operator>" /tmp/catalog/operator_info.txt  # check channels/namespaces
+```
+
+For the full workflow: see `docs/gitops-catalog.md` and the `create-kustomize-operator` skill.
+
+## ArgoCD Sync Wave Reference
+
+| Wave | Use for |
+|---|---|
+| 1 | Infrastructure operators (local-storage, CNV, Pipelines, NMState) |
+| 2 | Application operators that depend on wave 1 (ODF, ACM, AAP, DevSpaces) |
+| 3 | Operand instances (StorageSystem, HyperConverged CR, AAP instance, MCH) |
+| 4 | Deep instances that depend on wave 3 (ODF bare-metal after LSO) |
+| 5 | Deepest dependency (virt instance needing NMState + storage) |
+
+Prune decisions: `prune: false` for storage/stateful operators, `prune: true` for stateless.
+
 ## Troubleshooting ArgoCD Sync Failures
 
 ### Check overall application status
@@ -435,7 +467,7 @@ The `gitops/skills/` directory contains AI skill definitions. Run:
 ./gitops/skills/install-skills.sh --skill bootstrap-gitops  # install one skill
 ```
 
-Available skills:
+Available skills (11 total):
 - `bootstrap-gitops` — Bootstrap ArgoCD on a fresh cluster
 - `install-odf` — Install OpenShift Data Foundation
 - `install-virtualization` — Install OpenShift Virtualization (CNV)
@@ -445,3 +477,5 @@ Available skills:
 - `deploy-profile` — Deploy a full cluster profile
 - `troubleshoot-argocd` — Diagnose and fix ArgoCD sync failures
 - `configure-lab-environment` — Configure infra nodes + local storage + ODF + profile on any multi-node cluster
+- `create-kustomize-operator` — Scaffold a new operator (base + overlays + ArgoCD Application YAML)
+- `manage-argocd-apps` — Create and manage ArgoCD Applications, sync waves, app-of-apps profiles
