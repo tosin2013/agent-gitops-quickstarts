@@ -7,6 +7,8 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
 [![GitOps](https://img.shields.io/badge/GitOps-ArgoCD-orange)](https://argo-cd.readthedocs.io)
 
+**[📖 End-to-End Guide](docs/end-to-end-guide.md)** · **[🤖 AI Skills](gitops/skills/README.md)** · **[📋 Full Reference](llm.txt)**
+
 ---
 
 ## What This Is
@@ -119,6 +121,8 @@ improve skills, overlays, and profiles for new environment types. See [Self-Lear
 
 ## AI Skills
 
+> Full skills documentation: **[gitops/skills/README.md](gitops/skills/README.md)**
+
 Install skills for use with Claude Code (or any agentskills.io-compatible agent):
 
 ```bash
@@ -126,6 +130,12 @@ Install skills for use with Claude Code (or any agentskills.io-compatible agent)
 ./gitops/skills/install-skills.sh --all      # install all skills
 ./gitops/skills/install-skills.sh --skill bootstrap-gitops
 ```
+
+Once installed, trigger skills in Claude Code with natural language — for example:
+- *"bootstrap gitops on my cluster"*
+- *"install ODF on OCP 4.22"*
+- *"configure lab environment with nodes worker-0,worker-1,worker-2"*
+- *"ArgoCD not syncing — help me troubleshoot"*
 
 | Skill | Description |
 |---|---|
