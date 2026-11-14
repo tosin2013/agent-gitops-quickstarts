@@ -1,405 +1,535 @@
-#!/bin/bash
-set -x 
+#!/usr/bin/env bash
+# Configure a multi-node OpenShift cluster for Day 2 operations:
+# ArgoCD bootstrap → infra node labeling → Local Storage → ODF → profile deployment.
+#
+# Supports any node naming convention and OCP version.
+# With --learn, writes an execution journal that the learn-environment agent uses
+# to automatically improve skills, overlays, and profiles for new environment types.
+set -euo pipefail
 
-# Constants
-DEFAULT_STORAGE_CLASS_NAME="ocs-storagecluster-ceph-rbd"
-REPO_URL="https://github.com/tosin2013/sno-quickstarts.git"
+# ── Constants ────────────────────────────────────────────────────────────────
+DEFAULT_OCP_VERSION="4.22"
+DEFAULT_TIMEOUT=300
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$HOME/sno-quickstarts")"
 KUSTOMIZE_INSTALL_SCRIPT="https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"
-MAX_RETRIES=3
-TIMEOUT=300  # 5 minutes timeout for operations
-DEBUG=true   # Enable debug output
+LEARNINGS_DIR="$REPO_ROOT/gitops/learnings"
 
-# Debug function for logging
-debug_log() {
-    if [[ "$DEBUG" == "true" ]]; then
-        echo "[DEBUG] $(date '+%Y-%m-%d %H:%M:%S') - $1"
-    fi
+# ── Runtime state ─────────────────────────────────────────────────────────────
+OCP_VERSION="$DEFAULT_OCP_VERSION"
+NODES=""                   # comma-separated; auto-discovered if empty
+ODF_INSTANCE_OVERLAY=""    # auto-selected if empty
+PROFILE_NAME=""            # if empty, show interactive menu
+CONFIGURE_INFRA_NODES=false
+CONFIGURE_STORAGE=false
+LEARN=false
+DRY_RUN=false
+DEBUG=false
+TIMEOUT=$DEFAULT_TIMEOUT
+
+STEPS_COMPLETED=()
+OUTCOME="unknown"
+FAILURE_DETAIL=""
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log()   { echo "[$(date '+%H:%M:%S')] $*"; }
+debug() { [[ "$DEBUG" == "true" ]] && echo "[DEBUG] $*" || true; }
+warn()  { echo "[WARN]  $*" >&2; }
+die()   { echo "[ERROR] $*" >&2; exit 1; }
+
+dry() {
+  if $DRY_RUN; then
+    echo "[dry-run] $*"
+  else
+    eval "$@"
+  fi
 }
 
-# Print script usage information
+# ── Usage ────────────────────────────────────────────────────────────────────
 usage() {
-    echo "Usage: $0 [options]"
-    echo "Options:"
-    echo "  --configure-infra-nodes    Configure infra nodes"
-    echo "  --configure-storage        Configure storage"
-    echo "  -h, --help                 Display this help and exit"
+  cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+Configure a multi-node OpenShift cluster for Day 2 GitOps operations.
+
+Options:
+  --configure-infra-nodes        Label worker nodes as infra/storage nodes
+  --configure-storage            Install Local Storage Operator + ODF
+  --nodes node1,node2,node3      Storage node names (default: auto-discover workers)
+  --ocp-version 4.22             OCP version for operator channel selection (default: $DEFAULT_OCP_VERSION)
+  --odf-instance-overlay <name>  ODF StorageCluster overlay (default: auto-select by platform)
+  --profile <name>               Deploy this profile non-interactively
+  --learn                        Enable self-learning mode: write execution journal
+  --dry-run                      Print what would happen without making changes
+  --debug                        Enable verbose debug output
+  --timeout <seconds>            Operation timeout in seconds (default: $DEFAULT_TIMEOUT)
+  -h, --help                     Show this help
+
+Examples:
+  # Auto-discover nodes, use current OCP version:
+  $(basename "$0") --configure-infra-nodes --configure-storage
+
+  # Explicit nodes and version:
+  $(basename "$0") --configure-storage --nodes worker-0,worker-1,worker-2 --ocp-version 4.22
+
+  # Non-interactive with self-learning:
+  $(basename "$0") --configure-infra-nodes --configure-storage --profile kvm-ocp-virt --learn
+
+  # Dry run to preview changes:
+  $(basename "$0") --configure-storage --nodes lab-worker-0,lab-worker-1,lab-worker-2 --dry-run
+EOF
 }
 
-# Parse command line options
-while [[ "$1" =~ ^- && ! "$1" == "--" ]]; do case $1 in
-  --configure-infra-nodes )
-    CONFIGURE_INFRA_NODES=true
-    debug_log "Infra nodes configuration enabled"
-    ;;
-  --configure-storage )
-    CONFIGURE_STORAGE=true
-    debug_log "Storage configuration enabled"
-    ;;
-  -h | --help )
-    usage
-    exit
-    ;;
-esac; shift; done
-if [[ "$1" == '--' ]]; then shift; fi
-
-# Check if logged in to OpenShift
-if ! oc whoami &> /dev/null; then
-    echo "Not logged in to OpenShift. Exiting..."
-    exit 1
-fi
-
-# Helper function to wait for Pods to become Ready
-wait_for_pod() {
-    local pod_pattern=$1
-    local namespace=$2
-    local timeout=${3:-300}  # Default timeout of 5 minutes
-    local start_time=$(date +%s)
-    local end_time=$((start_time + timeout))
-    
-    echo "Waiting for pod matching '$pod_pattern' in namespace '$namespace' to be ready (timeout: ${timeout}s)..."
-    
-    while true; do
-        local current_time=$(date +%s)
-        if [[ $current_time -gt $end_time ]]; then
-            echo "Timeout waiting for pod matching '$pod_pattern' in namespace '$namespace'"
-            return 1
-        fi
-        
-        # Get the pod name
-        local pod_name=$(oc get pods -n $namespace | grep "$pod_pattern" | awk '{print $1}' | head -1)
-        
-        # If pod doesn't exist yet, wait and try again
-        if [[ -z "$pod_name" ]]; then
-            echo "Pod matching '$pod_pattern' not found in namespace '$namespace'. Waiting..."
-            sleep 10
-            continue
-        fi
-        
-        # Check if pod is ready
-        local ready_status=$(oc get pod $pod_name -n $namespace -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}')
-        
-        if [[ "$ready_status" == "True" ]]; then
-            echo "Pod '$pod_name' in namespace '$namespace' is ready."
-            return 0
-        fi
-        
-        echo "Waiting for pod '$pod_name' in namespace '$namespace' to be ready..."
-        sleep 10
-    done
-}
-
-# Clone necessary Git repository if it doesn't exist
-if [ ! -d "$HOME/sno-quickstarts" ]; then
-    git clone $REPO_URL "$HOME/sno-quickstarts"
-fi
-
-# Install Kustomize if not already installed
-if [ ! -f /usr/local/bin/kustomize ]; then
-    curl -s "$KUSTOMIZE_INSTALL_SCRIPT" | bash
-    sudo mv kustomize /usr/local/bin
-fi
-
-# Configuration functions
-configure_argocd() {
-    echo "Checking if ArgoCD is already running..."
-    
-    # First check if namespace exists
-    if oc get namespace openshift-gitops &>/dev/null; then
-        # Check if the ArgoCD repo server pod exists and is in a ready state
-        if oc get pods -l app.kubernetes.io/name=openshift-gitops-repo-server -n openshift-gitops &>/dev/null; then
-            local pod_ready=$(oc get pods -l app.kubernetes.io/name=openshift-gitops-repo-server -n openshift-gitops -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}' | grep True)
-            
-            if [ "$pod_ready" == "True" ]; then
-                echo "ArgoCD is already running and ready. Skipping configuration."
-                return 0
-            fi
-        fi
-    fi
-
-    echo "Configuring ArgoCD..."
-    
-    # Create namespace if it doesn't exist
-    if ! oc get namespace openshift-gitops &>/dev/null; then
-        echo "Creating openshift-gitops namespace..."
-        oc create namespace openshift-gitops || {
-            echo "Failed to create openshift-gitops namespace. Exiting."
-            return 1
-        }
-    fi
-    
-    # Apply initial configuration
-    echo "Applying initial GitOps configuration..."
-    oc create -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-gitops" || {
-        echo "Failed to apply initial GitOps configuration. Retrying..."
-        sleep 5
-        oc create -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-gitops" || {
-            echo "Failed to apply initial GitOps configuration after retry. Exiting."
-            return 1
-        }
-    }
-
-    # Wait for ArgoCD CRDs to be ready with timeout
-    echo "Waiting for ArgoCD CRDs to be available..."
-    local start_time=$(date +%s)
-    local end_time=$((start_time + TIMEOUT))
-    local crd_ready=false
-    
-    while [[ $(date +%s) -lt $end_time ]]; do
-        if oc get crd/argocds.argoproj.io &> /dev/null; then
-            echo "ArgoCD CRDs are available."
-            crd_ready=true
-            break
-        fi
-        echo "Waiting for ArgoCD CRDs to become available..."
-        sleep 10
-    done
-    
-    if [ "$crd_ready" != "true" ]; then
-        echo "Timeout waiting for ArgoCD CRDs. Exiting."
-        return 1
-    fi
-
-    # Apply full ArgoCD Configuration
-    echo "Applying full ArgoCD configuration..."
-    oc apply -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-gitops" || {
-        echo "Failed to apply full GitOps configuration. Retrying..."
-        sleep 5
-        oc apply -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-gitops" || {
-            echo "Failed to apply full GitOps configuration after retry. Exiting."
-            return 1
-        }
-    }
-    
-    # Wait for repo server pod to be ready
-    echo "Waiting for ArgoCD repo server pod to be ready..."
-    if ! wait_for_pod "openshift-gitops-repo-server" "openshift-gitops" $TIMEOUT; then
-        echo "Timeout waiting for ArgoCD repo server pod. Installation may be incomplete."
-        return 1
-    fi
-    
-    echo "ArgoCD configuration completed successfully."
-    return 0
-}
-
-
-configure_infranodes() {
-    local nodes=("lab-worker-0" "lab-worker-1" "lab-worker-2")
-    for node in "${nodes[@]}"; do
-        oc label node "$node" node-role.kubernetes.io/infra=""
-        oc label node "$node" cluster.ocs.openshift.io/openshift-storage=""
-    done
-    oc patch configs.imageregistry.operator.openshift.io/cluster --type=merge -p '{"spec":{"nodeSelector":{"node-role.kubernetes.io/infra": ""}}}'
-    oc patch ingresscontroller/default -n openshift-ingress-operator --type=merge -p '{"spec":{"nodePlacement": {"nodeSelector": {"matchLabels": {"node-role.kubernetes.io/infra": ""}},"tolerations": [{"effect":"NoSchedule","key": "node-role.kubernetes.io/infra","value": "reserved"},{"effect":"NoExecute","key": "node-role.kubernetes.io/infra","value": "reserved"}]}}}'
-}
-
-configure_storage() {
-    echo "Configuring OpenShift Local Storage and Data Foundation..."
-    
-    # Check if storage is already configured
-    if oc get localvolumeset -n openshift-local-storage &>/dev/null && oc get storagecluster -n openshift-storage &>/dev/null; then
-        echo "Storage appears to be already configured. Checking status..."
-        
-        # Verify storage cluster status
-        local storage_status=$(oc get storagecluster -n openshift-storage -o jsonpath='{.items[0].status.phase}' 2>/dev/null)
-        if [[ "$storage_status" == "Ready" ]]; then
-            echo "Storage cluster is already configured and ready. Skipping configuration."
-            return 0
-        else
-            echo "Storage cluster exists but is not in Ready state (current state: $storage_status). Will attempt to reconfigure."
-        fi
-    fi
-    
-    # Apply local storage operator
-    echo "Applying OpenShift Local Storage Operator..."
-    oc apply -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-local-storage/operator/overlays/stable-4.17" || {
-        echo "Failed to apply Local Storage Operator. Retrying..."
-        sleep 5
-        oc apply -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-local-storage/operator/overlays/stable-4.17" || {
-            echo "Failed to apply Local Storage Operator after retry. Exiting."
-            return 1
-        }
-    }
-    
-    # Apply ODF operator
-    echo "Applying OpenShift Data Foundation Operator..."
-    oc apply -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-data-foundation-operator/operator/overlays/stable-4.17" || {
-        echo "Failed to apply Data Foundation Operator. Retrying..."
-        sleep 5
-        oc apply -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-data-foundation-operator/operator/overlays/stable-4.17" || {
-            echo "Failed to apply Data Foundation Operator after retry. Exiting."
-            return 1
-        }
-    }
-    
-    echo "Waiting for operators to be installed..."
-    echo "This may take a few minutes..."
-    
-    # Wait for local storage operator namespace to be created
-    local start_time=$(date +%s)
-    local end_time=$((start_time + TIMEOUT))
-    local namespace_ready=false
-    
-    echo "Waiting for openshift-local-storage namespace to be available..."
-    while [[ $(date +%s) -lt $end_time ]]; do
-        if oc get namespace openshift-local-storage &>/dev/null; then
-            namespace_ready=true
-            break
-        fi
-        echo "Waiting for openshift-local-storage namespace..."
-        sleep 10
-    done
-    
-    if [[ "$namespace_ready" != "true" ]]; then
-        echo "Timeout waiting for openshift-local-storage namespace. Exiting."
-        return 1
-    fi
-    
-    # Wait for ODF operator namespace to be created
-    namespace_ready=false
-    echo "Waiting for openshift-storage namespace to be available..."
-    while [[ $(date +%s) -lt $end_time ]]; do
-        if oc get namespace openshift-storage &>/dev/null; then
-            namespace_ready=true
-            break
-        fi
-        echo "Waiting for openshift-storage namespace..."
-        sleep 10
-    done
-    
-    if [[ "$namespace_ready" != "true" ]]; then
-        echo "Timeout waiting for openshift-storage namespace. Exiting."
-        return 1
-    fi
-    
-    # Wait for local storage operator pod
-    echo "Waiting for Local Storage Operator pod to be ready..."
-    if ! wait_for_pod "local-storage-operator" "openshift-local-storage" $TIMEOUT; then
-        echo "Timeout waiting for Local Storage Operator pod. Installation may be incomplete."
-        return 1
-    fi
-    
-    # Wait for ODF operator pod
-    echo "Waiting for ODF Operator pod to be ready..."
-    if ! wait_for_pod "ocs-operator" "openshift-storage" $TIMEOUT; then
-        echo "Timeout waiting for ODF Operator pod. Installation may be incomplete."
-        return 1
-    fi
-    
-    # Create local storage instance
-    echo "Creating Local Storage instance..."
-    oc create -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-local-storage/instance/overlays/demo-redhat" || {
-        echo "Failed to create Local Storage instance. Retrying..."
-        sleep 5
-        oc create -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-local-storage/instance/overlays/demo-redhat" || {
-            echo "Failed to create Local Storage instance after retry. Exiting."
-            return 1
-        }
-    }
-    
-    # Wait for local volume discovery to complete
-    echo "Waiting for local volume discovery to complete..."
-    sleep 30
-    
-    # Create ODF instance
-    echo "Creating OpenShift Data Foundation instance..."
-    oc create -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-data-foundation-operator/instance/overlays/equinix-cnv" || {
-        echo "Failed to create ODF instance. Retrying..."
-        sleep 5
-        oc create -k "$HOME/sno-quickstarts/gitops/cluster-config/openshift-data-foundation-operator/instance/overlays/equinix-cnv" || {
-            echo "Failed to create ODF instance after retry. Exiting."
-            return 1
-        }
-    }
-    
-    # Verify storage cluster creation
-    echo "Verifying storage cluster creation..."
-    local verify_start_time=$(date +%s)
-    local verify_end_time=$((verify_start_time + 300)) # 5 minute timeout for verification
-    local storage_cluster_created=false
-    
-    while [[ $(date +%s) -lt $verify_end_time ]]; do
-        if oc get storagecluster -n openshift-storage &>/dev/null; then
-            storage_cluster_created=true
-            echo "Storage cluster created successfully."
-            break
-        fi
-        echo "Waiting for storage cluster to be created..."
-        sleep 20
-    done
-    
-    if [[ "$storage_cluster_created" != "true" ]]; then
-        echo "Timeout waiting for storage cluster to be created. Please check the status manually."
-        return 1
-    fi
-    
-    echo "Storage configuration completed successfully."
-    echo "Note: The storage cluster may take several minutes to become fully ready."
-    echo "You can check the status with: oc get storagecluster -n openshift-storage"
-    return 0
-}
-
-# Configuration Checks and Setup
-debug_log "Starting configuration process"
-debug_log "ArgoCD configuration is always enabled"
-configure_argocd || {
-    echo "ERROR: ArgoCD configuration failed. Exiting."
-    exit 1
-}
-
-if [[ "$CONFIGURE_INFRA_NODES" == "true" ]]; then
-    debug_log "Executing infra nodes configuration"
-    configure_infranodes || {
-        echo "ERROR: Infra nodes configuration failed. Exiting."
-        exit 1
-    }
-    debug_log "Infra nodes configuration completed successfully"
-else
-    debug_log "Skipping infra nodes configuration (flag not set)"
-fi
-
-if [[ "$CONFIGURE_STORAGE" == "true" ]]; then
-    debug_log "Executing storage configuration"
-    configure_storage || {
-        echo "ERROR: Storage configuration failed. Exiting."
-        exit 1
-    }
-    
-    # Verify storage configuration was successful
-    debug_log "Verifying storage configuration"
-    if oc get storagecluster -n openshift-storage &>/dev/null; then
-        echo "✅ Storage configuration verified: StorageCluster exists in openshift-storage namespace"
-    else
-        echo "⚠️ Storage configuration verification failed: StorageCluster not found in openshift-storage namespace"
-        echo "Please check the logs above for errors"
-    fi
-    
-    if oc get localvolumeset -n openshift-local-storage &>/dev/null; then
-        echo "✅ Storage configuration verified: LocalVolumeSet exists in openshift-local-storage namespace"
-    else
-        echo "⚠️ Storage configuration verification failed: LocalVolumeSet not found in openshift-local-storage namespace"
-        echo "Please check the logs above for errors"
-    fi
-    
-    debug_log "Storage configuration process completed"
-else
-    debug_log "Skipping storage configuration (flag not set)"
-fi
-
-#[ "$CONFIGURE_REGISTRY" = true ] && configure_registry
-
-# User interaction for applying configurations
-cd "$HOME/sno-quickstarts/gitops/apps"
-options=("Exit" $(find . -maxdepth 1 -type d -not -path '.'))
-select dir in "${options[@]}"; do
-    case "$dir" in
-        "Exit")
-            echo "Exiting..."
-            break
-            ;;
-        *)
-            dir=${dir#./}
-            echo "Applying configuration in $dir..."
-            oc apply -f "$dir/cluster-config.yaml"
-            ;;
-    esac
+# ── Argument parsing ─────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --configure-infra-nodes) CONFIGURE_INFRA_NODES=true ;;
+    --configure-storage)     CONFIGURE_STORAGE=true ;;
+    --nodes)                 NODES="$2"; shift ;;
+    --ocp-version)           OCP_VERSION="$2"; shift ;;
+    --odf-instance-overlay)  ODF_INSTANCE_OVERLAY="$2"; shift ;;
+    --profile)               PROFILE_NAME="$2"; shift ;;
+    --learn)                 LEARN=true ;;
+    --dry-run)               DRY_RUN=true ;;
+    --debug)                 DEBUG=true ;;
+    --timeout)               TIMEOUT="$2"; shift ;;
+    -h|--help)               usage; exit 0 ;;
+    *) warn "Unknown option: $1"; usage; exit 1 ;;
+  esac
+  shift
 done
+
+# ── Pre-flight checks ─────────────────────────────────────────────────────────
+if ! oc whoami &>/dev/null; then
+  die "Not logged in to OpenShift. Run 'oc login' first."
+fi
+
+# Install kustomize if missing (oc kustomize is a fallback but standalone is preferred)
+if ! command -v kustomize &>/dev/null && [[ ! -f /usr/local/bin/kustomize ]]; then
+  if ! $DRY_RUN; then
+    log "Installing kustomize..."
+    curl -s "$KUSTOMIZE_INSTALL_SCRIPT" | bash
+    sudo mv kustomize /usr/local/bin/kustomize
+  fi
+fi
+
+# ── Environment fingerprinting ────────────────────────────────────────────────
+fingerprint_environment() {
+  PLATFORM=$(oc get infrastructure cluster -o jsonpath='{.status.platform}' 2>/dev/null || echo "Unknown")
+  OCP_DETECTED=$(oc version 2>/dev/null | grep "Server Version" | awk '{print $3}' | cut -d. -f1-2 || echo "$OCP_VERSION")
+  CLUSTER_DOMAIN=$(oc get ingresses.config cluster -o jsonpath='{.spec.domain}' 2>/dev/null || echo "unknown")
+
+  # Auto-discover worker nodes if --nodes not supplied
+  if [[ -z "$NODES" ]]; then
+    log "Auto-discovering worker nodes..."
+    NODES=$(oc get nodes -l node-role.kubernetes.io/worker \
+      --no-headers -o custom-columns='NAME:.metadata.name' 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+    if [[ -z "$NODES" ]]; then
+      # Fall back to any non-master node
+      NODES=$(oc get nodes --no-headers \
+        -o custom-columns='NAME:.metadata.name,ROLES:.metadata.labels' 2>/dev/null \
+        | grep -v master | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')
+    fi
+    log "Discovered nodes: $NODES"
+  fi
+
+  NODE_COUNT=$(echo "$NODES" | tr ',' '\n' | grep -c .)
+  # Extract the non-numeric prefix to identify naming convention
+  FIRST_NODE=$(echo "$NODES" | cut -d, -f1)
+  NODE_PATTERN=$(echo "$FIRST_NODE" | sed 's/[0-9]*$//')
+
+  # Classify environment type from node pattern + platform
+  case "$NODE_PATTERN" in
+    *lab-worker*)   ENV_TYPE="red-hat-labs" ;;
+    *equinix*)      ENV_TYPE="equinix-metal" ;;
+    *vsphere*|*esxi*) ENV_TYPE="vsphere" ;;
+    *)
+      case "$PLATFORM" in
+        AWS)      ENV_TYPE="aws" ;;
+        GCP)      ENV_TYPE="gcp" ;;
+        Azure)    ENV_TYPE="azure" ;;
+        VSphere)  ENV_TYPE="vsphere" ;;
+        None)     ENV_TYPE="bare-metal-or-kvm" ;;
+        *)        ENV_TYPE="unknown-${PLATFORM,,}" ;;
+      esac
+      ;;
+  esac
+
+  # Gather cloud-specific metadata for richer learning journals
+  CLOUD_REGION=""
+  CLOUD_INSTANCE_TYPE=""
+  case "$PLATFORM" in
+    AWS)
+      CLOUD_REGION=$(oc get infrastructure cluster \
+        -o jsonpath='{.status.platformStatus.aws.region}' 2>/dev/null || echo "")
+      # Get instance type from first worker node
+      CLOUD_INSTANCE_TYPE=$(oc get nodes -l node-role.kubernetes.io/worker \
+        --no-headers -o jsonpath='{.items[0].metadata.labels.beta\.kubernetes\.io/instance-type}' \
+        2>/dev/null || echo "")
+      ;;
+    GCP)
+      CLOUD_REGION=$(oc get infrastructure cluster \
+        -o jsonpath='{.status.platformStatus.gcp.region}' 2>/dev/null || echo "")
+      CLOUD_INSTANCE_TYPE=$(oc get nodes -l node-role.kubernetes.io/worker \
+        --no-headers -o jsonpath='{.items[0].metadata.labels.beta\.kubernetes\.io/instance-type}' \
+        2>/dev/null || echo "")
+      ;;
+    Azure)
+      CLOUD_REGION=$(oc get infrastructure cluster \
+        -o jsonpath='{.status.platformStatus.azure.resourceGroupName}' 2>/dev/null || echo "")
+      ;;
+  esac
+
+  # Auto-select ODF instance overlay if not supplied
+  if [[ -z "$ODF_INSTANCE_OVERLAY" ]]; then
+    case "$ENV_TYPE" in
+      aws)            ODF_INSTANCE_OVERLAY="aws" ;;
+      gcp)            ODF_INSTANCE_OVERLAY="gcp" ;;
+      azure)          ODF_INSTANCE_OVERLAY="azure" ;;
+      vsphere)        ODF_INSTANCE_OVERLAY="vsphere" ;;
+      equinix-metal)  ODF_INSTANCE_OVERLAY="equinix-cnv" ;;
+      *)              ODF_INSTANCE_OVERLAY="bare-metal" ;;
+    esac
+    log "Auto-selected ODF instance overlay: $ODF_INSTANCE_OVERLAY"
+  fi
+
+  debug "Environment: platform=$PLATFORM ocp=$OCP_DETECTED type=$ENV_TYPE nodes=$NODES"
+}
+
+# ── Pod wait helper ──────────────────────────────────────────────────────────
+wait_for_pod() {
+  local pattern="$1" namespace="$2" timeout="${3:-$TIMEOUT}"
+  local end=$(($(date +%s) + timeout))
+  log "Waiting for pod matching '$pattern' in $namespace (timeout: ${timeout}s)..."
+  while [[ $(date +%s) -lt $end ]]; do
+    local pod
+    pod=$(oc get pods -n "$namespace" 2>/dev/null | grep "$pattern" | awk '{print $1}' | head -1)
+    if [[ -n "$pod" ]]; then
+      local ready
+      ready=$(oc get pod "$pod" -n "$namespace" \
+        -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+      if [[ "$ready" == "True" ]]; then
+        log "Pod '$pod' is Ready."
+        return 0
+      fi
+    fi
+    sleep 10
+  done
+  warn "Timeout waiting for $pattern in $namespace"
+  return 1
+}
+
+# ── ArgoCD bootstrap ─────────────────────────────────────────────────────────
+configure_argocd() {
+  log "Checking ArgoCD status..."
+
+  if oc get namespace openshift-gitops &>/dev/null; then
+    local ready
+    ready=$(oc get pods -l app.kubernetes.io/name=openshift-gitops-repo-server \
+      -n openshift-gitops \
+      -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+    if [[ "$ready" == "True" ]]; then
+      log "ArgoCD already running and ready. Skipping bootstrap."
+      STEPS_COMPLETED+=("argocd-skipped-already-running")
+      return 0
+    fi
+  fi
+
+  log "Bootstrapping ArgoCD..."
+  local gitops_path="$REPO_ROOT/gitops/cluster-config/openshift-gitops"
+
+  dry "oc create namespace openshift-gitops 2>/dev/null || true"
+  dry "oc create -k '$gitops_path' 2>/dev/null || oc apply -k '$gitops_path'"
+
+  if ! $DRY_RUN; then
+    # Wait for ArgoCD CRD
+    local end=$(($(date +%s) + TIMEOUT))
+    until oc get crd/argocds.argoproj.io &>/dev/null; do
+      [[ $(date +%s) -lt $end ]] || die "Timeout waiting for ArgoCD CRD"
+      sleep 10
+    done
+
+    dry "oc apply -k '$gitops_path'"
+    wait_for_pod "openshift-gitops-repo-server" "openshift-gitops" "$TIMEOUT" || die "ArgoCD repo server not ready"
+  fi
+
+  log "ArgoCD bootstrap complete."
+  STEPS_COMPLETED+=("argocd")
+}
+
+# ── Infra node labeling ───────────────────────────────────────────────────────
+configure_infranodes() {
+  log "Labeling infra/storage nodes: $NODES"
+
+  IFS=',' read -ra NODE_ARRAY <<< "$NODES"
+  for node in "${NODE_ARRAY[@]}"; do
+    dry "oc label node '$node' node-role.kubernetes.io/infra='' --overwrite"
+    dry "oc label node '$node' cluster.ocs.openshift.io/openshift-storage='' --overwrite"
+  done
+
+  dry "oc patch configs.imageregistry.operator.openshift.io/cluster --type=merge \
+    -p '{\"spec\":{\"nodeSelector\":{\"node-role.kubernetes.io/infra\": \"\"}}}'"
+
+  dry "oc patch ingresscontroller/default -n openshift-ingress-operator --type=merge \
+    -p '{\"spec\":{\"nodePlacement\":{\"nodeSelector\":{\"matchLabels\":{\"node-role.kubernetes.io/infra\":\"\"}},\"tolerations\":[{\"effect\":\"NoSchedule\",\"key\":\"node-role.kubernetes.io/infra\",\"value\":\"reserved\"},{\"effect\":\"NoExecute\",\"key\":\"node-role.kubernetes.io/infra\",\"value\":\"reserved\"}]}}}'"
+
+  log "Infra node labeling complete."
+  STEPS_COMPLETED+=("infra-nodes")
+}
+
+# ── Dynamic local-storage overlay generation ──────────────────────────────────
+generate_lso_overlay() {
+  # Build a temporary kustomize overlay with the actual node names
+  local tmpdir
+  tmpdir=$(mktemp -d)
+
+  IFS=',' read -ra NODE_ARRAY <<< "$NODES"
+  local node_values=""
+  for node in "${NODE_ARRAY[@]}"; do
+    node_values+="                  - $node"$'\n'
+  done
+
+  cat > "$tmpdir/kustomization.yaml" <<KUST
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: openshift-local-storage
+bases:
+  - $REPO_ROOT/gitops/cluster-config/openshift-local-storage/instance/base
+patches:
+- target:
+    kind: LocalVolumeDiscovery
+    name: auto-discover-devices
+  patch: |-
+    apiVersion: local.storage.openshift.io/v1alpha1
+    kind: LocalVolumeDiscovery
+    metadata:
+      name: auto-discover-devices
+      namespace: openshift-local-storage
+    spec:
+      nodeSelector:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+$(echo "$node_values")- target:
+    kind: LocalVolumeSet
+    name: lolvol
+  patch: |-
+    apiVersion: local.storage.openshift.io/v1alpha1
+    kind: LocalVolumeSet
+    metadata:
+      name: lolvol
+      namespace: openshift-local-storage
+    spec:
+      nodeSelector:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/hostname
+                operator: In
+                values:
+$(echo "$node_values")KUST
+
+  echo "$tmpdir"
+}
+
+# ── Storage configuration ─────────────────────────────────────────────────────
+configure_storage() {
+  log "Configuring Local Storage Operator + ODF..."
+  local lso_op="$REPO_ROOT/gitops/cluster-config/openshift-local-storage/operator/overlays/stable-${OCP_VERSION}"
+  local odf_op="$REPO_ROOT/gitops/cluster-config/openshift-data-foundation-operator/operator/overlays/stable-${OCP_VERSION}"
+  local odf_inst="$REPO_ROOT/gitops/cluster-config/openshift-data-foundation-operator/instance/overlays/${ODF_INSTANCE_OVERLAY}"
+
+  # Idempotency check
+  if ! $DRY_RUN; then
+    if oc get storagecluster -n openshift-storage &>/dev/null 2>&1; then
+      local phase
+      phase=$(oc get storagecluster -n openshift-storage \
+        -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "")
+      if [[ "$phase" == "Ready" ]]; then
+        log "StorageCluster already Ready. Skipping."
+        STEPS_COMPLETED+=("storage-skipped-already-ready")
+        return 0
+      fi
+    fi
+  fi
+
+  # Verify overlay paths exist
+  [[ -d "$lso_op" ]] || die "LSO overlay not found: $lso_op. Try --ocp-version <version>"
+  [[ -d "$odf_op" ]] || die "ODF operator overlay not found: $odf_op"
+  [[ -d "$odf_inst" ]] || die "ODF instance overlay not found: $odf_inst"
+
+  dry "oc apply -k '$lso_op'"
+  dry "oc apply -k '$odf_op'"
+
+  if ! $DRY_RUN; then
+    # Wait for namespaces
+    for ns in openshift-local-storage openshift-storage; do
+      local end=$(($(date +%s) + TIMEOUT))
+      until oc get namespace "$ns" &>/dev/null; do
+        [[ $(date +%s) -lt $end ]] || die "Timeout waiting for namespace $ns"
+        sleep 10
+      done
+    done
+    wait_for_pod "local-storage-operator" "openshift-local-storage" "$TIMEOUT"
+    wait_for_pod "ocs-operator" "openshift-storage" "$TIMEOUT"
+  fi
+
+  # Generate dynamic LSO instance overlay with actual node names
+  log "Generating local-storage instance overlay for nodes: $NODES"
+  local lso_tmpdir
+  lso_tmpdir=$(generate_lso_overlay)
+  dry "oc create -k '$lso_tmpdir' || oc apply -k '$lso_tmpdir'"
+
+  if ! $DRY_RUN; then
+    log "Waiting 30s for local volume discovery..."
+    sleep 30
+  fi
+
+  dry "oc create -k '$odf_inst' || oc apply -k '$odf_inst'"
+
+  if ! $DRY_RUN; then
+    # Verify StorageCluster created
+    local end=$(($(date +%s) + 300))
+    until oc get storagecluster -n openshift-storage &>/dev/null; do
+      [[ $(date +%s) -lt $end ]] || die "Timeout: StorageCluster not created"
+      sleep 20
+    done
+    log "✅ StorageCluster created."
+    log "Note: StorageCluster may take several minutes to reach Ready state."
+    log "Check: oc get storagecluster -n openshift-storage"
+  fi
+
+  log "Storage configuration complete."
+  STEPS_COMPLETED+=("storage")
+}
+
+# ── Profile deployment ────────────────────────────────────────────────────────
+deploy_profile() {
+  local apps_dir="$REPO_ROOT/gitops/apps"
+
+  if [[ -n "$PROFILE_NAME" ]]; then
+    local profile_yaml="$apps_dir/$PROFILE_NAME/cluster-config.yaml"
+    [[ -f "$profile_yaml" ]] || die "Profile not found: $profile_yaml"
+    log "Deploying profile: $PROFILE_NAME"
+    dry "oc apply -f '$profile_yaml'"
+    STEPS_COMPLETED+=("profile:$PROFILE_NAME")
+  else
+    # Interactive menu
+    cd "$apps_dir"
+    local options=("Exit" $(find . -maxdepth 1 -type d -not -path '.'))
+    select dir in "${options[@]}"; do
+      case "$dir" in
+        "Exit") log "Exiting profile selection."; break ;;
+        *)
+          dir="${dir#./}"
+          log "Deploying profile: $dir"
+          dry "oc apply -f '$dir/cluster-config.yaml'"
+          STEPS_COMPLETED+=("profile:$dir")
+          break
+          ;;
+      esac
+    done
+  fi
+}
+
+# ── Execution journal writer ──────────────────────────────────────────────────
+write_journal() {
+  local ts
+  ts=$(date -u '+%Y%m%dT%H%M%SZ')
+  # Raw journal — full data, local only (gitignored via *.raw.yaml rule)
+  local raw_journal="$LEARNINGS_DIR/${ts}-${ENV_TYPE}.raw.yaml"
+  # Sanitized journal — no sensitive data, safe to commit
+  local clean_journal="$LEARNINGS_DIR/${ts}-${ENV_TYPE}.yaml"
+  local sanitizer="$REPO_ROOT/gitops/sanitize-journal.sh"
+
+  mkdir -p "$LEARNINGS_DIR"
+
+  # Write raw journal with full data (stays local)
+  cat > "$raw_journal" <<JOURNAL
+# RAW execution journal — NEVER COMMIT THIS FILE (contains sensitive data)
+# Created by configure-redhat-labs.sh --learn
+# Read by: .claude/agents/learn-environment.md
+# Sanitized version: $(basename "$clean_journal")
+timestamp: "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+env_type: "$ENV_TYPE"
+platform: "$PLATFORM"
+ocp_version_detected: "$OCP_DETECTED"
+ocp_version_used: "$OCP_VERSION"
+cluster_domain: "$CLUSTER_DOMAIN"
+node_count: $NODE_COUNT
+node_pattern: "$NODE_PATTERN"
+node_names: [$(echo "$NODES" | sed 's/,/, /g')]
+lso_instance_overlay: "generated-runtime-${NODE_PATTERN}N"
+odf_instance_overlay: "$ODF_INSTANCE_OVERLAY"
+cloud_region: "${CLOUD_REGION:-}"
+cloud_instance_type: "${CLOUD_INSTANCE_TYPE:-}"
+profile_deployed: "$(echo "${STEPS_COMPLETED[@]}" | grep -oP 'profile:\K[^ ]+' 2>/dev/null || echo 'none')"
+steps_completed: [$(printf '"%s", ' "${STEPS_COMPLETED[@]}" | sed 's/, $//')]
+outcome: "$OUTCOME"
+failure_detail: "$FAILURE_DETAIL"
+JOURNAL
+
+  log "Raw journal written (local only): $raw_journal"
+
+  # Produce sanitized version for git commit
+  if [[ -x "$sanitizer" ]]; then
+    bash "$sanitizer" "$raw_journal" "$clean_journal"
+    log "Sanitized journal written (safe to commit): $clean_journal"
+  else
+    # Fallback: basic scrub if sanitizer not found
+    sed -E \
+      -e 's|(cluster_domain: ).*$|\1<redacted>|' \
+      -e 's|node_names: \[.*\]|node_names: [<redacted>]|' \
+      "$raw_journal" > "$clean_journal"
+    log "Basic sanitization applied (sanitize-journal.sh not found)"
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "Self-learning mode: execution journals written."
+  echo ""
+  echo "  Raw (local only):   $raw_journal"
+  echo "  Sanitized (commit): $clean_journal"
+  echo ""
+  echo "To review and commit the sanitized learning:"
+  echo "  git add gitops/learnings/$(basename "$clean_journal")"
+  echo "  git commit -m 'docs(learn): add ${ENV_TYPE} environment pattern'"
+  echo ""
+  echo "To improve skills, overlays, and profiles from this run:"
+  echo "  Open Claude Code and say:"
+  echo "  'review the latest learning at gitops/learnings/ and update skills'"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+fingerprint_environment
+
+if $DRY_RUN; then
+  echo ""
+  echo "DRY RUN — no changes will be made"
+  echo "  Environment type:  $ENV_TYPE"
+  echo "  Platform:          $PLATFORM"
+  echo "  OCP version:       $OCP_VERSION"
+  echo "  Nodes:             $NODES"
+  echo "  ODF overlay:       $ODF_INSTANCE_OVERLAY"
+  echo "  Flags:             infra-nodes=$CONFIGURE_INFRA_NODES storage=$CONFIGURE_STORAGE"
+  echo ""
+fi
+
+# Always bootstrap ArgoCD
+configure_argocd || { OUTCOME="failed-at-argocd"; FAILURE_DETAIL="configure_argocd failed"; $LEARN && write_journal; die "ArgoCD bootstrap failed"; }
+
+if $CONFIGURE_INFRA_NODES; then
+  configure_infranodes || { OUTCOME="failed-at-infra-nodes"; FAILURE_DETAIL="configure_infranodes failed"; $LEARN && write_journal; die "Infra node labeling failed"; }
+fi
+
+if $CONFIGURE_STORAGE; then
+  configure_storage || { OUTCOME="failed-at-storage"; FAILURE_DETAIL="configure_storage failed"; $LEARN && write_journal; die "Storage configuration failed"; }
+fi
+
+deploy_profile
+
+OUTCOME="success"
+$LEARN && write_journal
+
+log "Done. ✅"

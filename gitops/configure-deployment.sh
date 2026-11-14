@@ -1,4 +1,13 @@
-#!/bin/bash 
+#!/bin/bash
+# DEPRECATED: This script is superseded by configure-redhat-labs.sh + the configure-lab-environment skill.
+# It was a prototype for SNO+ZTP at OCP 4.11 and is no longer maintained.
+#
+# Use instead:
+#   ./configure-redhat-labs.sh --help
+#   gitops/skills/configure-lab-environment/SKILL.md
+#
+# This file is kept for reference only and may be removed in a future release.
+
 
 if [ ! -f $HOME/sno-quickstarts ];
 then 

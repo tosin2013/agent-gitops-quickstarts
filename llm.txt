@@ -1,0 +1,447 @@
+# agent-gitops-quickstarts — LLM Reference
+
+This file is the authoritative AI reference for the agent-gitops-quickstarts repository.
+It is designed to give language models a complete picture of the codebase without needing to
+explore the filesystem.
+
+## Project Overview
+
+agent-gitops-quickstarts (formerly sno-quickstarts) provides GitOps-driven Day 2 configuration
+for **any OpenShift deployment** using ArgoCD + Kustomize. It is the logical continuation of:
+  https://github.com/tosin2013/openshift-agent-install  (Day 1: cluster provisioning)
+
+Supported OpenShift versions: **OCP 4.9 through 5.0** (all minor versions).
+
+Supported platforms:
+- **Bare-metal** (IPI, UPI, Assisted Installer, ZTP)
+- **KVM / libvirt** (OpenShift on virtual machines)
+- **VMware vSphere** (IPI and UPI)
+- **Equinix Metal** (bare-metal cloud)
+- **AWS** (IPI and ROSA)
+- **Google Cloud Platform (GCP)**
+- **Azure** (IPI and ARO)
+- **Single Node OpenShift (SNO)** on any of the above platforms
+- **3-node compact** and standard HA topologies
+
+## Repository Structure
+
+```
+agent-gitops-quickstarts/
+  LICENSE                         # Apache 2.0
+  llm.txt                         # This file
+  AGENTS.md                       # Universal AI agent guardrails
+  CLAUDE.md                       # Claude Code project instructions
+  gitops/
+    deploy.sh                     # Bootstrap script (run first)
+    configure-deployment.sh       # Post-bootstrap configuration helper
+    configure-redhat-labs.sh      # Red Hat Labs environment setup
+    apps/                         # Profile entry-points (one per use-case)
+    cluster-config/               # Operator manifests (Kustomize bases + overlays)
+      apps/                       # ArgoCD Application sets (one per profile)
+      <operator-name>/            # Per-operator kustomize tree
+    init/                         # ArgoCD bootstrap manifests
+    skills/                       # AI skill definitions (SKILL.md files)
+```
+
+## Repository Options — Where to Host Your GitOps Repo
+
+ArgoCD pulls manifests from a Git repository. The default points to
+`https://github.com/tosin2013/sno-quickstarts.git`. Before deploying, **choose one**:
+
+| Option | When to use | Setup |
+|---|---|---|
+| **GitHub (original)** | Evaluating or testing; public internet access | No setup needed |
+| **GitHub fork** | Customizing; still have internet access | Fork on GitHub, then run `configure-repo.sh` |
+| **Self-hosted Gitea** | Air-gapped, on-prem, or no GitHub access | Run `setup-gitea.sh` (auto-deploys Gitea on OpenShift) |
+| **GitLab / Bitbucket / other** | Enterprise Git already available | Push repo there, then run `configure-repo.sh` |
+
+### Reconfigure the repo URL (required for all non-default options)
+
+```bash
+# Dry-run first to see what would change (111 files total):
+./gitops/configure-repo.sh --dry-run https://your-git-server/your-org/sno-quickstarts.git
+
+# Apply the change:
+./gitops/configure-repo.sh https://your-git-server/your-org/sno-quickstarts.git
+
+# Then push to your repo:
+git push your-remote main
+```
+
+### Deploy self-hosted Gitea on OpenShift (air-gapped / on-prem option)
+
+```bash
+# Option A — fully automated (deploy Gitea + push repo + reconfigure URLs):
+./gitops/setup-gitea.sh
+
+# Option B — manual steps:
+# 1. Download and run the Gitea deployer:
+curl -OL https://raw.githubusercontent.com/tosin2013/openshift-demos/master/quick-scripts/deploy-gitea.sh
+chmod +x deploy-gitea.sh
+./deploy-gitea.sh
+
+# 2. After Gitea is up, reconfigure:
+./gitops/configure-repo.sh https://gitea-gitea.apps.<cluster>.<domain>/<admin>/sno-quickstarts.git
+```
+
+### Add ArgoCD repo credentials (private repos)
+
+After reconfiguring, tell ArgoCD how to authenticate:
+
+```bash
+oc create secret generic repo-creds -n openshift-gitops \
+  --from-literal=username=<git-user> \
+  --from-literal=password=<token-or-password> \
+  --from-literal=url=<your-repo-url>
+oc label secret repo-creds -n openshift-gitops argocd.argoproj.io/secret-type=repository
+```
+
+## configure-redhat-labs.sh — Multi-Node Lab Orchestrator
+
+`gitops/configure-redhat-labs.sh` is the end-to-end Day 2 configuration script for
+multi-node clusters. It orchestrates: ArgoCD bootstrap → infra node labeling →
+Local Storage Operator → ODF → profile deployment.
+
+It works on **any platform** (bare-metal, KVM, Equinix, Red Hat Labs, vSphere) and
+**any node naming convention** (node names are auto-discovered or supplied via `--nodes`).
+
+### Key flags
+
+| Flag | Purpose |
+|---|---|
+| `--configure-infra-nodes` | Label worker nodes as infra/storage + patch ingress + registry |
+| `--configure-storage` | Install LSO + ODF with auto-generated node overlay |
+| `--nodes node1,node2,node3` | Explicit node names (default: auto-discover workers) |
+| `--ocp-version 4.22` | OCP version for operator channels (default: 4.22) |
+| `--odf-instance-overlay <name>` | ODF StorageCluster overlay (default: auto-select by platform) |
+| `--profile <name>` | Deploy this profile non-interactively |
+| `--learn` | Write execution journal → triggers self-learning |
+| `--dry-run` | Preview changes without making them |
+
+### Examples
+
+```bash
+# Dry-run preview:
+./gitops/configure-redhat-labs.sh --dry-run --configure-storage --nodes worker-0,worker-1,worker-2
+
+# Full auto-discover, self-learning:
+./gitops/configure-redhat-labs.sh --configure-infra-nodes --configure-storage --profile kvm-ocp-virt --learn
+
+# Red Hat Labs explicit:
+./gitops/configure-redhat-labs.sh \
+  --configure-infra-nodes --configure-storage \
+  --nodes lab-worker-0,lab-worker-1,lab-worker-2 \
+  --ocp-version 4.22 --learn
+```
+
+### Self-Learning System
+
+```
+configure-redhat-labs.sh --learn
+        ↓
+writes gitops/learnings/<timestamp>-<env_type>.yaml
+        ↓
+"review the latest learning at gitops/learnings/ and update skills"
+        ↓
+learn-environment agent (.claude/agents/learn-environment.md):
+  SUCCESS → creates overlays, profiles, wrapper scripts, updates skill Known Working Configs
+  FAILURE → adds failure modes to configure-lab-environment/SKILL.md
+```
+
+Over time this makes the repo smarter for every new cluster type that gets configured.
+
+## Bootstrap Flow
+
+```
+1. oc login https://api.<cluster>.<domain>:6443    # authenticate to cluster
+2. ./gitops/deploy.sh                               # bootstrap ArgoCD
+   - creates namespace: openshift-gitops
+   - oc create -k gitops/cluster-config/openshift-gitops
+   - oc apply  -k gitops/cluster-config/openshift-gitops
+3. oc apply -f gitops/apps/<profile>/cluster-config.yaml  # deploy a profile
+   - Creates an ArgoCD Application pointing to gitops/cluster-config/apps/<profile>/
+   - ArgoCD creates the Application-of-Apps, which creates per-operator Applications
+   - Each operator Application syncs its Kustomize overlay to the cluster
+```
+
+ArgoCD runs in namespace `openshift-gitops`. The ArgoCD server is accessible via the
+`openshift-gitops-server` route in that namespace.
+
+## Kustomize Base/Overlay Pattern
+
+Every operator directory follows this structure:
+
+```
+<operator>/
+  operator/
+    base/                         # Namespace, OperatorGroup, Subscription (placeholder channel)
+      kustomization.yaml
+      <operator>-subscription.yaml   # channel: patch-me-see-overlays-dir
+      ...
+    overlays/
+      <channel-name>/             # e.g. stable-4.19, latest, stable-5.0
+        kustomization.yaml        # resources: [../../base], patches: [patch-channel.yaml]
+        patch-channel.yaml        # JSON patch: replace /spec/channel with actual value
+        README.md
+  instance/                       # CRD instance (StorageCluster, HyperConverged, etc.)
+    base/
+    overlays/
+      <platform>/                 # e.g. aws, bare-metal, sno, vsphere
+```
+
+To deploy an operator at a specific OCP version: use the matching overlay path in the
+ArgoCD Application's `spec.source.path`.
+
+## Profile Catalog
+
+Profiles live in `gitops/apps/<name>/cluster-config.yaml`. Each creates an ArgoCD Application
+that points to `gitops/cluster-config/apps/<name>/`.
+
+| Profile | Platform | Use Case | Key Operators |
+|---|---|---|---|
+| `sno-ocp-virt` | Any (SNO) | SNO + OpenShift Virtualization | CNV, hostpath-provisioner, Pipelines |
+| `standard-sno-deployment` | Any (SNO) | SNO + full storage stack | ODF-LVM, ODF, Pipelines |
+| `kvm-ocp-virt` | KVM/libvirt | KVM VMs + Virtualization + storage | CNV, local-storage, ODF, Pipelines |
+| `aws-odf-deployment` | AWS | AWS cluster + ODF storage | local-storage, ODF (gp2), Pipelines |
+| `gcp-odf-deployment` | GCP | GCP cluster + ODF storage | local-storage, ODF (standard-csi), Pipelines |
+| `vmware-odf-deployment` | vSphere | VMware + ODF storage | ODF, local-storage |
+| `equinix-cnv-virtualization` | Equinix Metal | Bare-metal + Virtualization | CNV, NMState, local-storage, Pipelines |
+| `equinix-developer-env` | Equinix Metal | Bare-metal developer environment | AAP, Dev Spaces, ODF, local-storage |
+| `acm-gitops-deployment` | Any | RHACM hub cluster | RHACM, multicluster-engine |
+| `aap-instance` | Any | Ansible Automation Platform | AAP operator + instance + hub |
+| `developer-env` | Any | Developer tooling stack | AAP, Dev Spaces |
+| `baremetal-rhacm-hub` | Bare-metal | Full bare-metal hub | RHACM, AAP, Dev Spaces |
+| `device-edge-demos` | Any | Device Edge + Quay | AAP, Dev Spaces, ODF, Noobaa, Pipelines, Quay |
+| `kafka-plus-db` | Any | Event streaming + database | AMQ Streams, Crunchy PostgreSQL |
+| `middleware-ocpv` | Any | Middleware on OCP Virt | AAP, local-storage, ODF |
+| `rhel-edge-management` | Any | RHEL Edge management | CNV, ODF-LVM, hostpath-provisioner, Pipelines |
+
+## Operator Categories (24 total)
+
+### Storage
+- **openshift-data-foundation-operator** — ODF (Ceph-based, multi-node)
+  Channels: stable-4.9 through stable-4.19, stable-5.0
+  Namespace: openshift-storage | Package: odf-operator
+  Instance: StorageSystem + StorageCluster
+  Platform overlays: aws (gp2), bare-metal (local-devices), vsphere (thick), gcp (standard-csi), azure (managed-premium), kvm (local-block), sno, equinix-cnv
+
+- **odf-lvm-operator** — ODF LVM (single-node or edge, local disk — no Ceph)
+  Channels: stable-4.11 through stable-4.19
+  Namespace: openshift-storage | Package: lvms-operator
+  Instance: LVMCluster
+  Best for: SNO, 3-node compact, KVM single-node, edge deployments
+
+- **openshift-local-storage** — Local Storage Operator
+  Channels: stable-4.9 through stable-4.19, stable-5.0
+  Namespace: openshift-local-storage | Package: local-storage-operator
+  Instance: LocalVolumeDiscovery + LocalVolumeSet
+  Required before ODF on bare-metal, KVM, and Equinix platforms
+
+- **openshift-container-storage-noobaa** — Noobaa object storage (standalone)
+  Namespace: openshift-storage
+
+- **hostpath-provisioner** — HostPath provisioner for SNO/edge storage
+  Namespace: openshift-cnv | Overlays: sdb, vdb
+
+### Compute / Virtualization
+- **openshift-virtualization** — OpenShift Virtualization (CNV/KubeVirt)
+  Channel: stable
+  Namespace: openshift-cnv | Package: kubevirt-hyperconverged
+  Instance: HyperConverged CR
+  Overlays: sno (with hostpath-provisioner SC), standard
+
+### GitOps
+- **openshift-gitops** — OpenShift GitOps (ArgoCD)
+  Channel: latest | Namespace: openshift-gitops
+  Includes: ArgoCD CR, RBAC (cluster-admin SA), console integration
+
+### CI/CD
+- **openshift-pipelines-operator** — OpenShift Pipelines (Tekton)
+  Channels: latest, stable, preview, pipelines-1.8/1.9/1.10, latest-5.0
+  Cluster-scoped (no namespace)
+
+### Cluster Management
+- **rhacm-operator** — Red Hat Advanced Cluster Management hub operator
+  Channels: release-2.11, stable-5.0
+  Namespace: open-cluster-management | Package: advanced-cluster-management
+
+- **rhacm-instance** — RHACM MultiClusterHub instance
+  Overlays: basic, ha, ha-infra
+
+### Automation
+- **ansible-automation-platform** — AAP operator + instances
+  Channels: stable-2.5, stable-2.5-cluster-scoped
+  Namespace: aap | Package: ansible-automation-platform-operator
+  Instances: default, aws, azure, gcp
+
+### Networking
+- **nmstate** — NMState Network operator
+  Channel: stable | Namespace: openshift-nmstate
+
+### Developer Tools
+- **devspaces** — Red Hat Dev Spaces (Eclipse Che)
+  Channel: stable | Namespace: openshift-operators
+  Instance: CheCluster CR
+
+### Messaging
+- **amq-streams-operator** — AMQ Streams (Apache Kafka)
+  Channels: stable, 1.8.x, 1.x, 2.0.x, 2.1.x, 2.x
+  Namespace: developer-space (or as configured)
+
+### Database
+- **crunchy-postgres** — Crunchy Data PostgreSQL
+  Channel: v5 | Namespace: database-project
+
+### Registry / Image Management
+- **quay-registry-operator** — Red Hat Quay
+  Channels: stable-3.8, stable-3.13, stable-3.14
+
+- **openshift-image-registry** — Internal image registry config
+  Namespace: openshift-image-registry
+
+### Observability
+- **redhat-build-of-opentelemetry** — OpenTelemetry Operator
+  Channel: stable
+
+### Configuration Management
+- **chrony-config** — NTP/chrony MachineConfig
+  Applied via MachineConfig (no operator)
+
+- **openshift-container-storage-noobaa** — Noobaa standalone config
+
+### AI/ML
+- **jupyter-notebook-validator-operator** — Custom notebook validation operator
+  Custom image: quay.io/takinosh/jupyter-notebook-validator-operator
+  CRD: NotebookValidationJob (mlops.mlops.dev)
+  Overlays: dev-ocp4.18, dev-ocp4.19, dev-ocp4.20
+  Note: not from OperatorHub; uses cert-manager + webhooks
+
+### ZTP / Spoke Provisioning
+- **agent-service-config** — Assisted Installer service config
+  Overlays: connected, disconnected
+
+- **spoke-sno-ztp** — ZTP manifests for SNO spoke
+  Resources: AgentClusterInstall, ClusterDeployment, InfraEnv, BareMetalHost, NMStateConfig
+
+- **spoke-3nodes-ztp** — ZTP manifests for 3-node compact spoke
+  Same pattern as spoke-sno-ztp
+
+### Artifact Repository
+- **pulp-repository** — Pulp content management
+  Channel: beta
+
+## Supported OCP Versions (Doc-verified)
+
+Current releases as of November 2026 (verified from docs.redhat.com):
+- **4.22** — latest 4.x — Kubernetes 1.35 (CURRENT RECOMMENDED)
+- **4.21** — Kubernetes 1.34
+- **4.20** — Kubernetes 1.33
+- **4.19** — Kubernetes 1.32
+- **5.0** — new major — Kubernetes 1.36 (OLM v1, RHCOS 10)
+
+## OCP Version Matrix
+
+| Operator | 4.9–4.11 | 4.12 | 4.13 | 4.14 | 4.15 | 4.16 | 4.17 | 4.18 | 4.19 | 4.20 | 4.21 | 4.22 | 5.0 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| ODF | stable-4.9–4.11 | stable-4.12 | stable-4.13 | stable-4.14 | stable-4.15 | stable-4.16 | stable-4.17 | stable-4.18 | stable-4.19 | stable-4.20 | stable-4.21 | **stable-4.22** | stable-5.0 |
+| ODF-LVM | stable-4.11 | stable-4.12 | stable-4.13 | stable-4.14 | stable-4.15 | stable-4.16 | stable-4.17 | stable-4.18 | stable-4.19 | stable-4.20 | stable-4.21 | **stable-4.22** | — |
+| Local Storage | stable-4.9–4.11 | stable-4.12 | stable-4.13 | stable-4.14 | stable-4.15 | stable-4.16 | stable-4.17 | stable-4.18 | stable-4.19 | stable-4.20 | stable-4.21 | **stable-4.22** | stable-5.0 |
+| CNV | stable | stable | stable | stable | stable | stable | stable | stable | stable | stable | stable | **stable** | stable |
+| Pipelines | latest | latest | latest | latest | latest | latest | latest | latest | latest | latest | latest | **latest** | latest-5.0 |
+| RHACM | release-2.x | release-2.x | release-2.x | release-2.x | release-2.x | release-2.x | release-2.x | release-2.x | release-2.x | release-2.x | release-2.x | **release-2.x** | stable-5.0 |
+
+**Bold** = current recommended. Overlays exist in this repo for all versions shown.
+
+## Platform Storage Decision Guide
+
+| Platform | Recommended Storage | ODF Instance Overlay |
+|---|---|---|
+| AWS | ODF with gp2 EBS | `instance/overlays/aws` |
+| GCP | ODF with standard-csi PD | `instance/overlays/gcp` |
+| Azure | ODF with managed-premium | `instance/overlays/azure` |
+| VMware vSphere | ODF with vSphere datastores | `instance/overlays/vsphere` |
+| Equinix / bare-metal | ODF with local-storage | `instance/overlays/bare-metal` |
+| KVM / libvirt | ODF with local-storage | `instance/overlays/kvm` |
+| SNO (any platform) | ODF-LVM (single node) or hostpath-provisioner | `odf-lvm-operator/instance/overlays/` |
+
+**OCP 5.0 Notes**:
+- Uses RHCOS 10; ODF requires x86-64-v3+ CPU microarchitecture
+- OLM v1 (`ClusterExtension` API) is introduced but classic `Subscription` still supported
+- ACM 5.0 channel confirmed: `stable-5.0`
+
+## ArgoCD Sync Wave Ordering
+
+Operators that have dependencies use `argocd.argoproj.io/sync-wave` annotations:
+- Wave 1: Operators (Subscription + OperatorGroup)
+- Wave 2: Post-install config (console plugins, labeling jobs)
+- Wave 3: Instances (StorageCluster, HyperConverged, etc.)
+- Wave 4+: Applications/workloads that depend on storage/virt
+
+## Troubleshooting ArgoCD Sync Failures
+
+### Check overall application status
+```bash
+oc get application -n openshift-gitops
+oc get application -n openshift-gitops -o wide
+```
+
+### Get detailed sync error for a specific app
+```bash
+oc describe application <app-name> -n openshift-gitops
+```
+
+### Check ArgoCD server logs
+```bash
+oc logs -n openshift-gitops deployment/openshift-gitops-server | tail -50
+```
+
+### Common failure modes
+
+1. **Subscription stuck in "UpgradePending"**
+   - Cause: InstallPlan requires manual approval
+   - Fix: `oc patch installplan -n <ns> <name> --type merge -p '{"spec":{"approved":true}}'`
+
+2. **Namespace not created**
+   - Cause: ArgoCD Application missing `CreateNamespace=true` syncOption
+   - Fix: Add `syncOptions: [CreateNamespace=true]` to the Application spec
+
+3. **Resource out of sync (Unknown)**
+   - Cause: CRD not yet registered (operator still installing)
+   - Fix: Wait for operator pod to be Running; ArgoCD will retry
+
+4. **Permission denied syncing**
+   - Cause: ArgoCD SA lacks cluster-admin
+   - Fix: Verify `gitops/cluster-config/openshift-gitops/rbac.yaml` ClusterRoleBinding exists
+
+5. **Kustomize build failure**
+   - Cause: Missing base resource or overlay references deleted resource
+   - Fix: Run `kustomize build <overlay-path>` locally to see exact error
+
+6. **ODF StorageCluster stuck**
+   - Cause: Insufficient nodes (ODF requires 3 nodes for Ceph, or use LVM for SNO)
+   - Fix: Use `odf-lvm-operator` instead for SNO/single-node
+
+7. **ArgoCD app stuck in Progressing**
+   - Cause: Resource health check failing (e.g. Deployment not reaching desired replicas)
+   - Fix: Check pod events: `oc get events -n <namespace> --sort-by=.lastTimestamp`
+
+## Skills
+
+The `gitops/skills/` directory contains AI skill definitions. Run:
+
+```bash
+./gitops/skills/install-skills.sh --list     # list all available skills
+./gitops/skills/install-skills.sh --all      # install all skills
+./gitops/skills/install-skills.sh --skill bootstrap-gitops  # install one skill
+```
+
+Available skills:
+- `bootstrap-gitops` — Bootstrap ArgoCD on a fresh cluster
+- `install-odf` — Install OpenShift Data Foundation
+- `install-virtualization` — Install OpenShift Virtualization (CNV)
+- `install-acm` — Install RHACM hub
+- `configure-ztp` — Configure ZTP spoke clusters
+- `install-aap` — Install Ansible Automation Platform
+- `deploy-profile` — Deploy a full cluster profile
+- `troubleshoot-argocd` — Diagnose and fix ArgoCD sync failures
+- `configure-lab-environment` — Configure infra nodes + local storage + ODF + profile on any multi-node cluster

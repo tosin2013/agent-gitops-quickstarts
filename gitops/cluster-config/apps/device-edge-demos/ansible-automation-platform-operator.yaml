@@ -12,7 +12,7 @@ spec:
     server: https://kubernetes.default.svc
   project: default
   source:
-    path: gitops/cluster-config/ansible-automation-platform/operator/overlays/stable-2.4-cluster-scoped
+    path: gitops/cluster-config/ansible-automation-platform/operator/overlays/stable-2.5-cluster-scoped
     repoURL:  https://github.com/tosin2013/sno-quickstarts.git
     targetRevision: main
   syncPolicy:

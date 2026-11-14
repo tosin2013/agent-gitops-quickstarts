@@ -1,0 +1,10 @@
+# Raw learning journals — contain real cluster domains and node names
+# These stay LOCAL and are NEVER committed.
+*.raw.yaml
+
+# Sanitized journals (*.yaml without .raw) ARE committed — they have no sensitive data.
+# The sanitize-journal.sh script produces these from the raw files.
+!*.yaml
+!README.md
+!.gitkeep
+!.gitignore

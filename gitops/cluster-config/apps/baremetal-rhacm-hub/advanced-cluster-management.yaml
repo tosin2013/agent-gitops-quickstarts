@@ -12,7 +12,7 @@ spec:
     server: https://kubernetes.default.svc
   project: default
   source:
-    path: gitops/cluster-config/rhacm-operator/base
+    path: gitops/cluster-config/rhacm-operator/overlays/release-2.11
     repoURL: https://github.com/tosin2013/sno-quickstarts.git
     targetRevision: main
   syncPolicy:
