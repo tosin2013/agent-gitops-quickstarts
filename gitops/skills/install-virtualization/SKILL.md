@@ -53,6 +53,44 @@ oc get vmi -A 2>/dev/null
 oc get node -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.capacity.cpu}{"\n"}{end}'
 ```
 
+### Hardware Gate — Run Before Installing CNV
+
+**Before applying this skill, check whether cluster nodes have enough resources for VM workloads.** OpenShift Virtualization is not useful if workers have no headroom to run VMs.
+
+```bash
+# Node RAM and CPU capacity
+oc get nodes -o custom-columns=\
+"NAME:.metadata.name,\
+ROLE:.metadata.labels.node-role\.kubernetes\.io/worker,\
+RAM:.status.capacity.memory,\
+CPU:.status.capacity.cpu,\
+ALLOC_RAM:.status.allocatable.memory"
+
+# Worker node count and allocatable RAM
+WORKER_COUNT=$(oc get nodes -l node-role.kubernetes.io/worker --no-headers 2>/dev/null | wc -l)
+echo "Worker nodes: ${WORKER_COUNT}"
+
+# Per-worker allocatable memory (subtract OS/kubelet overhead ~4GB)
+oc get nodes -l node-role.kubernetes.io/worker \
+  -o jsonpath='{range .items[*]}{.metadata.name}: {.status.allocatable.memory}{"\n"}{end}' 2>/dev/null
+```
+
+**Decision rules:**
+
+| Condition | Action |
+|-----------|--------|
+| 0 worker nodes (SNO) | Use SNO overlay with hostpath-provisioner — no live migration |
+| Workers with < 8GB allocatable RAM | ❌ **Block** — not enough for any VM; tell user to resize nodes or use a larger host |
+| Workers with 8–16GB allocatable RAM | ⚠️ **Warn** — small VMs only (512MB–2GB); ask user to confirm before proceeding |
+| Workers with ≥ 16GB allocatable RAM | ✅ Proceed — can run realistic VMs |
+| Workers with ≥ 32GB allocatable RAM | ✅ Recommended for production-like demos |
+| < 2 worker nodes | ⚠️ **Warn** — live migration requires 2+ nodes; SNO overlay lacks this |
+
+**If the hardware does not meet requirements:** tell the user and stop. Do not apply the CNV operator just because the subscription can be created — CNV without runnable VMs is not useful.
+
+Example response when workers are too small:
+> "Your worker nodes have only 10GB allocatable RAM each. After OS overhead, there is ~6GB available for VMs. This is not enough for meaningful OpenShift Virtualization workloads. Options: (1) resize workers to at least 16GB RAM, (2) use a larger host, or (3) proceed with the understanding that only tiny test VMs (512MB) will work."
+
 ## Steps
 
 ### Step 1: Choose the right overlay
