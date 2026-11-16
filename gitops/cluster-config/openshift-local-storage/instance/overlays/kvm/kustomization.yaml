@@ -1,3 +1,7 @@
+# KVM overlay for Local Storage Operator instance
+# ODF runs on WORKERS (worker-0/1/2) — NOT masters.
+# Masters must stay NoSchedule: ODF OSDs on control-plane nodes cause crashloops
+# competing with etcd and kube-apiserver for memory and CPU.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -16,14 +20,6 @@ patches:
       kind: LocalVolumeSet
       name: lolvol
   - path: patch-storage-class.yaml
-    target:
-      kind: LocalVolumeSet
-      name: lolvol
-  - path: patch-tolerations.yaml
-    target:
-      kind: LocalVolumeDiscovery
-      name: auto-discover-devices
-  - path: patch-tolerations.yaml
     target:
       kind: LocalVolumeSet
       name: lolvol

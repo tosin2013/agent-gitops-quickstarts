@@ -1,3 +1,4 @@
+# ODF instance: targets worker-0/1/2 — masters stay NoSchedule
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Application
