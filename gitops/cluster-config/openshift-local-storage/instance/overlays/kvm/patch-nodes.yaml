@@ -1,0 +1,6 @@
+- op: replace
+  path: /spec/nodeSelector/nodeSelectorTerms/0/matchExpressions/0/values
+  value:
+    - master-0
+    - master-1
+    - master-2

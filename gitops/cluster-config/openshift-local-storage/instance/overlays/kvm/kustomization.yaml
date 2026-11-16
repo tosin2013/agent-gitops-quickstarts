@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: openshift-local-storage
+
+bases:
+  - ../../base
+
+patches:
+  - path: patch-nodes.yaml
+    target:
+      kind: LocalVolumeDiscovery
+      name: auto-discover-devices
+  - path: patch-nodes.yaml
+    target:
+      kind: LocalVolumeSet
+      name: lolvol
+  - path: patch-storage-class.yaml
+    target:
+      kind: LocalVolumeSet
+      name: lolvol
