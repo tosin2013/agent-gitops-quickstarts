@@ -4,6 +4,8 @@ kind: Application
 metadata:
   name: openshift-pipelines-operator
   namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
 spec:
   destination:
     namespace: openshift-operators
@@ -16,6 +18,12 @@ spec:
   syncPolicy:
     automated:
       prune: false
-      selfHeal: false
+      selfHeal: true
     syncOptions:
     - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        maxDuration: 5m0s
+        factor: 2

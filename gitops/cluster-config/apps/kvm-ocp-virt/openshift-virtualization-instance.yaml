@@ -18,6 +18,14 @@ spec:
   syncPolicy:
     automated:
       prune: false
-      selfHeal: false
+      selfHeal: true
     syncOptions:
     - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 60s
+        maxDuration: 10m0s
+        factor: 2
