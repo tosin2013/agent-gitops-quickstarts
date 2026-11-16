@@ -19,3 +19,11 @@ patches:
     target:
       kind: LocalVolumeSet
       name: lolvol
+  - path: patch-tolerations.yaml
+    target:
+      kind: LocalVolumeDiscovery
+      name: auto-discover-devices
+  - path: patch-tolerations.yaml
+    target:
+      kind: LocalVolumeSet
+      name: lolvol
