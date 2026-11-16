@@ -1,0 +1,34 @@
+---
+# OpenShift Lightspeed Profile
+# Installs: Lightspeed 2.0 operator + OLSConfig (rhoai-vllm provider by default)
+#
+# Requirements:
+#   - OCP 5.0+ only (Lightspeed 2.0 requires OCP 5.0)
+#   - OpenShift GitOps (ArgoCD) already deployed
+#   - Provider credentials secret created before sync:
+#       oc create secret generic llm-credentials -n openshift-lightspeed --from-literal=apitoken=<key>
+#
+# Optional add-ons:
+#   - MCP server for agentic troubleshooting (see docs/lightspeed-mcp.md)
+#   - Crunchy Postgres for conversation cache
+#
+# Provider options (change instance app path to switch):
+#   rhoai-vllm (default), openai, azure-openai, gemini-api, watsonx, rhelai-vllm
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cluster-config-lightspeed
+  namespace: openshift-gitops
+spec:
+  destination:
+    namespace: openshift-gitops
+    server: https://kubernetes.default.svc
+  project: default
+  source:
+    path: gitops/cluster-config/apps/lightspeed
+    repoURL: https://github.com/tosin2013/agent-gitops-quickstarts.git
+    targetRevision: main
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

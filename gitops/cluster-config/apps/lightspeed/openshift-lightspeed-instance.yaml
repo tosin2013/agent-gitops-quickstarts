@@ -1,0 +1,37 @@
+---
+# Default provider: rhoai-vllm (compatible with external MaaS endpoints, no local GPU needed)
+# To use a different provider, change the path to instance/overlays/<provider>
+# Available: openai, azure-openai, gemini-api, gemini-vertex, rhoai-vllm, rhelai-vllm, watsonx
+#
+# REQUIRED before applying: create the provider credentials secret
+#   oc create secret generic llm-credentials -n openshift-lightspeed --from-literal=apitoken=<key>
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: openshift-lightspeed-instance
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  destination:
+    namespace: openshift-lightspeed
+    server: https://kubernetes.default.svc
+  project: default
+  source:
+    path: gitops/cluster-config/openshift-lightspeed-operator/instance/overlays/rhoai-vllm
+    repoURL: https://github.com/tosin2013/agent-gitops-quickstarts.git
+    targetRevision: main
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    - ServerSideApply=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 60s
+        maxDuration: 10m0s
+        factor: 2
