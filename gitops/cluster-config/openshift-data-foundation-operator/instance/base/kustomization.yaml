@@ -3,5 +3,6 @@ kind: Kustomization
 
 namespace: openshift-storage
 
-resources:
-  - storagesystem.yaml
+# storagesystem.yaml removed: odf.openshift.io/v1alpha1 StorageSystem CRD
+# not present in ODF v4.22.7-rhodf on OCP 5.0
+resources: []

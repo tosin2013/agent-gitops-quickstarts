@@ -34,7 +34,6 @@ spec:
   managedResources:
     cephBlockPools: {}
     cephCluster: {}
-    cephConfig: {}
     cephDashboard: {}
     cephFilesystems: {}
     cephObjectStoreUsers: {}
