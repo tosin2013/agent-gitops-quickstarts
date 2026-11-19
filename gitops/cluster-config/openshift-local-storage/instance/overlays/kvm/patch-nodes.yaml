@@ -1,6 +1,6 @@
 - op: replace
   path: /spec/nodeSelector/nodeSelectorTerms/0/matchExpressions/0/values
   value:
-    - worker-0
-    - worker-1
-    - worker-2
+    - lab-worker-0
+    - lab-worker-1
+    - lab-worker-2
