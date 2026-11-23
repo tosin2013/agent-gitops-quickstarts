@@ -1,0 +1,20 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: label-monitoring-nodes
+  namespace: openshift-monitoring
+spec:
+  template:
+    spec:
+      serviceAccountName: prometheus-k8s
+      restartPolicy: OnFailure
+      containers:
+      - name: label
+        image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          for node in lab-worker-3 lab-worker-4 lab-worker-5; do
+            oc label node $node monitoring-node=true --overwrite
+          done

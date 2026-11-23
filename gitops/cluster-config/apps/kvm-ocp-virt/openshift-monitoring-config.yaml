@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: openshift-monitoring-config
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  destination:
+    namespace: openshift-monitoring
+    server: https://kubernetes.default.svc
+  project: default
+  source:
+    path: gitops/cluster-config/openshift-monitoring/base
+    repoURL: https://github.com/tosin2013/agent-gitops-quickstarts.git
+    targetRevision: main
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+    - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        maxDuration: 5m0s
+        factor: 2

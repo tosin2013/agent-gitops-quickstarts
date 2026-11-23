@@ -1,0 +1,42 @@
+# Pin monitoring stack to non-ODF worker nodes and set resource limits.
+# Without this, Prometheus competes with Ceph OSDs on the same nodes,
+# causing load spikes that crash the kube-apiserver (context deadline exceeded).
+# Ref: https://docs.redhat.com/en/documentation/openshift_container_platform/5.0/html/monitoring/configuring-monitoring-stack
+#
+# Prerequisites: label non-ODF workers before applying:
+#   oc label node lab-worker-3 lab-worker-4 lab-worker-5 monitoring-node=true
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    prometheusK8s:
+      nodeSelector:
+        monitoring-node: "true"
+      resources:
+        requests:
+          cpu: 200m
+          memory: 2Gi
+        limits:
+          cpu: 4000m
+          memory: 8Gi
+      retention: 24h
+      retentionSize: 20GB
+    alertmanagerMain:
+      nodeSelector:
+        monitoring-node: "true"
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    thanosQuerier:
+      nodeSelector:
+        monitoring-node: "true"
+    prometheusOperator:
+      nodeSelector:
+        monitoring-node: "true"
