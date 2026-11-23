@@ -5,7 +5,7 @@ metadata:
   name: openshift-data-foundation-operator
   namespace: openshift-gitops
   annotations:
-    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/sync-wave: "2"
 spec:
   destination:
     namespace: openshift-storage
