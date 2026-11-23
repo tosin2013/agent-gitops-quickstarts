@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+bases:
+  - ../../base
+resources:
+  - registry-pvc.yaml
+patches:
+  - path: patch-odf-cephfs.yaml
+    target:
+      kind: Config
+      name: cluster
