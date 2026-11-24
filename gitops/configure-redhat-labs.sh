@@ -499,7 +499,7 @@ patches:
               - key: kubernetes.io/hostname
                 operator: In
                 values:
-$(echo "$node_values")- target:
+${node_values}- target:
     kind: LocalVolumeSet
     name: lolvol
   patch: |-
@@ -515,7 +515,8 @@ $(echo "$node_values")- target:
               - key: kubernetes.io/hostname
                 operator: In
                 values:
-$(echo "$node_values")KUST
+${node_values}
+KUST
 
   echo "$tmpdir"
 }
