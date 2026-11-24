@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# Configure a multi-node OpenShift cluster for Day 2 operations:
-# ArgoCD bootstrap → infra node labeling → Local Storage → ODF → profile deployment.
+# Configure a multi-node OpenShift cluster for Day 2 operations.
+#
+# Execution order (each step waits for the previous to complete):
+#   1. Wait for cluster health (all operators Available, no Degraded)
+#   2. Configure monitoring (pin Prometheus to non-ODF workers, set resource limits)
+#   3. Install cert-manager + issue *.apps wildcard cert (optional, --configure-certs)
+#   4. Bootstrap ArgoCD
+#   5. Label infra/storage nodes (--configure-infra-nodes)
+#   6. Install LSO + ODF (--configure-storage)
+#   7. Deploy profile (kvm-ocp-virt or interactive)
 #
 # Supports any node naming convention and OCP version.
 # With --learn, writes an execution journal that the learn-environment agent uses
@@ -21,6 +29,12 @@ ODF_INSTANCE_OVERLAY=""    # auto-selected if empty
 PROFILE_NAME=""            # if empty, show interactive menu
 CONFIGURE_INFRA_NODES=false
 CONFIGURE_STORAGE=false
+CONFIGURE_CERTS=false
+CONFIGURE_MONITORING=true       # always on — prevents Prometheus competing with Ceph
+MONITORING_NODES=""             # comma-separated non-ODF workers; auto-detected if empty
+CERT_EMAIL=""                   # required for --configure-certs
+CERT_ZONE_ID=""                 # Route53 hosted zone ID
+CERT_REGION="us-east-1"
 LEARN=false
 DRY_RUN=false
 DEBUG=false
@@ -84,6 +98,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --configure-infra-nodes) CONFIGURE_INFRA_NODES=true ;;
     --configure-storage)     CONFIGURE_STORAGE=true ;;
+    --configure-certs)       CONFIGURE_CERTS=true ;;
+    --no-monitoring)         CONFIGURE_MONITORING=false ;;
+    --monitoring-nodes)      MONITORING_NODES="$2"; shift ;;
+    --cert-email)            CERT_EMAIL="$2"; shift ;;
+    --cert-zone-id)          CERT_ZONE_ID="$2"; shift ;;
+    --cert-region)           CERT_REGION="$2"; shift ;;
     --nodes)                 NODES="$2"; shift ;;
     --ocp-version)           OCP_VERSION="$2"; shift ;;
     --odf-instance-overlay)  ODF_INSTANCE_OVERLAY="$2"; shift ;;
@@ -216,6 +236,174 @@ wait_for_pod() {
   done
   warn "Timeout waiting for $pattern in $namespace"
   return 1
+}
+
+# ── Cluster health gate ──────────────────────────────────────────────────────
+# Wait until all ClusterOperators are Available=True, Progressing=False, Degraded=False.
+# This MUST run before any Day 2 operations — doing cert rotation, monitoring migration,
+# and GitOps simultaneously while operators are still rolling causes control plane overload.
+wait_for_cluster_healthy() {
+  local timeout="${1:-900}"   # 15 min default
+  local end=$(($(date +%s) + timeout))
+  log "Waiting for all cluster operators to be healthy (timeout: ${timeout}s)..."
+  log "  This prevents Day 2 operations from overloading a cluster mid-rollout."
+
+  while [[ $(date +%s) -lt $end ]]; do
+    local degraded progressing unavailable
+    degraded=$(oc get co --no-headers 2>/dev/null | awk '$5=="True"{print $1}' | wc -l)
+    progressing=$(oc get co --no-headers 2>/dev/null | awk '$4=="True"{print $1}' | wc -l)
+    unavailable=$(oc get co --no-headers 2>/dev/null | awk '$3=="False"{print $1}' | wc -l)
+
+    if [[ "$degraded" -eq 0 && "$progressing" -eq 0 && "$unavailable" -eq 0 ]]; then
+      log "✅ All cluster operators healthy."
+      STEPS_COMPLETED+=("cluster-health-gate")
+      return 0
+    fi
+
+    log "  Degraded=$degraded Progressing=$progressing Unavailable=$unavailable — waiting 30s..."
+    sleep 30
+  done
+  warn "Cluster did not become fully healthy within ${timeout}s — proceeding anyway."
+}
+
+# ── Monitoring configuration ──────────────────────────────────────────────────
+# Pin Prometheus/Alertmanager to non-ODF workers and set resource limits.
+# Without this, Prometheus competes with Ceph OSDs for CPU, causing load spikes
+# that crash the kube-apiserver (context deadline exceeded / etcd timeout).
+#
+# Ref: https://docs.redhat.com/en/documentation/openshift_container_platform/5.0/html/monitoring/configuring-monitoring-stack
+configure_monitoring() {
+  log "Configuring cluster monitoring (pinning Prometheus to non-ODF workers)..."
+
+  # Auto-detect monitoring nodes: last N workers (non-ODF ones)
+  if [[ -z "$MONITORING_NODES" ]]; then
+    local all_workers odf_nodes odf_count monitoring_node_list
+    all_workers=$(oc get nodes -l node-role.kubernetes.io/worker \
+      --no-headers -o custom-columns='NAME:.metadata.name' 2>/dev/null)
+    odf_count=$(echo "$NODES" | tr ',' '\n' | grep -c . || echo 3)
+    # Non-ODF workers = all workers minus the first N (ODF) ones
+    monitoring_node_list=$(echo "$all_workers" | tail -n +"$((odf_count + 1))" | head -3 | tr '\n' ',')
+    MONITORING_NODES="${monitoring_node_list%,}"
+    log "  Auto-detected monitoring nodes: $MONITORING_NODES"
+  fi
+
+  if [[ -z "$MONITORING_NODES" ]]; then
+    warn "No non-ODF worker nodes found — monitoring config skipped."
+    return 0
+  fi
+
+  # Label the monitoring nodes
+  IFS=',' read -ra MON_NODES <<< "$MONITORING_NODES"
+  for node in "${MON_NODES[@]}"; do
+    dry "oc label node '$node' monitoring-node=true --overwrite"
+  done
+
+  # Apply ClusterMonitoring configmap
+  if ! $DRY_RUN; then
+    oc apply -f - << 'MONEOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    prometheusK8s:
+      nodeSelector:
+        monitoring-node: "true"
+      resources:
+        requests:
+          cpu: 200m
+          memory: 2Gi
+        limits:
+          cpu: 4000m
+          memory: 8Gi
+      retention: 24h
+      retentionSize: 20GB
+    alertmanagerMain:
+      nodeSelector:
+        monitoring-node: "true"
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 512Mi
+    thanosQuerier:
+      nodeSelector:
+        monitoring-node: "true"
+    prometheusOperator:
+      nodeSelector:
+        monitoring-node: "true"
+MONEOF
+    log "✅ Monitoring pinned to: $MONITORING_NODES"
+    log "  Waiting 60s for monitoring pods to migrate..."
+    sleep 60
+  fi
+
+  STEPS_COMPLETED+=("monitoring-config")
+}
+
+# ── cert-manager + *.apps cert ────────────────────────────────────────────────
+# Install cert-manager and issue a Let's Encrypt wildcard cert for *.apps.
+# Must run BEFORE GitOps so the ingress cert is in place before the console
+# is fully configured. Does NOT rotate the API server cert (--include-api flag
+# risks kubelet auth breakage on baremetal).
+#
+# Ref: openshift-5-deployment-notes/post-steps/create_custom_cert.sh
+configure_certs() {
+  if [[ -z "$CERT_EMAIL" || -z "$CERT_ZONE_ID" ]]; then
+    warn "--configure-certs requires --cert-email and --cert-zone-id. Skipping."
+    return 0
+  fi
+
+  log "Installing cert-manager and issuing *.apps Let's Encrypt cert..."
+
+  local cert_manager_dir="$REPO_ROOT/../../openshift-5-deployment-notes"
+  if [[ ! -d "$cert_manager_dir" ]]; then
+    warn "openshift-5-deployment-notes repo not found at $cert_manager_dir — skipping certs."
+    return 0
+  fi
+
+  dry "oc apply -k '$cert_manager_dir/cert-manager/operator/overlays/stable-v1'"
+
+  if ! $DRY_RUN; then
+    log "  Waiting for cert-manager CSV to reach Succeeded..."
+    until oc get csv -n cert-manager-operator 2>/dev/null | grep -q "Succeeded"; do
+      sleep 15
+    done
+
+    # Create CertManager CR if not present
+    oc apply -f - 2>/dev/null << 'CMEOF' || true
+apiVersion: operator.openshift.io/v1alpha1
+kind: CertManager
+metadata:
+  name: cluster
+spec:
+  managementState: Managed
+  controllerConfig:
+    overrideArgs:
+    - "--dns01-recursive-nameservers-only"
+    - "--dns01-recursive-nameservers=1.1.1.1:53"
+CMEOF
+
+    log "  Waiting for cert-manager pods..."
+    until oc get pods -n cert-manager 2>/dev/null | grep -c "Running" | grep -qE "^[3-9]"; do
+      sleep 10
+    done
+
+    log "  Issuing *.apps certificate via Route53 DNS01..."
+    bash "$cert_manager_dir/post-steps/create_custom_cert.sh" \
+      "$(aws configure get aws_access_key_id)" \
+      "$(aws configure get aws_secret_access_key)" \
+      "$CERT_EMAIL" \
+      "$CERT_ZONE_ID" \
+      "$CERT_REGION" 2>&1 || warn "Cert issuance failed — continuing without custom cert."
+  fi
+
+  log "✅ cert-manager configuration complete."
+  STEPS_COMPLETED+=("cert-manager")
 }
 
 # ── ArgoCD bootstrap ─────────────────────────────────────────────────────────
@@ -516,17 +704,39 @@ if $DRY_RUN; then
   echo ""
 fi
 
-# Always bootstrap ArgoCD
+# Step 1: Wait for cluster to be fully healthy before ANY Day 2 operations.
+# Doing cert rotation, monitoring migration, and GitOps while operators are
+# still rolling causes control plane CPU overload (load 90-117 observed).
+if ! $DRY_RUN; then
+  wait_for_cluster_healthy 900
+fi
+
+# Step 2: Pin monitoring to non-ODF workers and set resource limits.
+# Must run before ODF so Prometheus doesn't compete with Ceph OSDs for CPU.
+if $CONFIGURE_MONITORING; then
+  configure_monitoring || { OUTCOME="failed-at-monitoring"; FAILURE_DETAIL="configure_monitoring failed"; $LEARN && write_journal; warn "Monitoring config failed — continuing"; }
+fi
+
+# Step 3: cert-manager + *.apps cert (optional).
+# Must run after cluster is healthy but before GitOps so the console cert is ready.
+if $CONFIGURE_CERTS; then
+  configure_certs || { OUTCOME="failed-at-certs"; FAILURE_DETAIL="configure_certs failed"; $LEARN && write_journal; warn "Cert config failed — continuing"; }
+fi
+
+# Step 4: Bootstrap ArgoCD.
 configure_argocd || { OUTCOME="failed-at-argocd"; FAILURE_DETAIL="configure_argocd failed"; $LEARN && write_journal; die "ArgoCD bootstrap failed"; }
 
+# Step 5: Label infra/storage nodes.
 if $CONFIGURE_INFRA_NODES; then
   configure_infranodes || { OUTCOME="failed-at-infra-nodes"; FAILURE_DETAIL="configure_infranodes failed"; $LEARN && write_journal; die "Infra node labeling failed"; }
 fi
 
+# Step 6: Install LSO + ODF.
 if $CONFIGURE_STORAGE; then
   configure_storage || { OUTCOME="failed-at-storage"; FAILURE_DETAIL="configure_storage failed"; $LEARN && write_journal; die "Storage configuration failed"; }
 fi
 
+# Step 7: Deploy profile.
 deploy_profile
 
 OUTCOME="success"
