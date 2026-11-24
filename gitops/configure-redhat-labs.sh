@@ -17,7 +17,7 @@ set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_OCP_VERSION="4.22"
-DEFAULT_TIMEOUT=300
+DEFAULT_TIMEOUT=600   # increased from 300 — ArgoCD operator download can take 5-10min
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$HOME/sno-quickstarts")"
 KUSTOMIZE_INSTALL_SCRIPT="https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"
 LEARNINGS_DIR="$REPO_ROOT/gitops/learnings"
@@ -360,11 +360,27 @@ configure_certs() {
 
   log "Installing cert-manager and issuing *.apps Let's Encrypt cert..."
 
-  local cert_manager_dir="$REPO_ROOT/../../openshift-5-deployment-notes"
-  if [[ ! -d "$cert_manager_dir" ]]; then
-    warn "openshift-5-deployment-notes repo not found at $cert_manager_dir — skipping certs."
+  # Locate openshift-5-deployment-notes repo — check common locations
+  local cert_manager_dir="${OCP5_NOTES_DIR:-}"
+  if [[ -z "$cert_manager_dir" ]]; then
+    for candidate in \
+      "$HOME/openshift-5-deployment-notes" \
+      "/tmp/openshift-5-deployment-notes" \
+      "$REPO_ROOT/../openshift-5-deployment-notes" \
+      "$REPO_ROOT/../../openshift-5-deployment-notes"; do
+      if [[ -d "$candidate/post-steps" ]]; then
+        cert_manager_dir="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$cert_manager_dir" || ! -d "$cert_manager_dir" ]]; then
+    warn "openshift-5-deployment-notes repo not found. Set OCP5_NOTES_DIR=/path/to/repo or clone it first."
+    warn "  git clone https://github.com/tosin2013/openshift-5-deployment-notes /tmp/openshift-5-deployment-notes"
+    warn "Skipping cert-manager configuration."
     return 0
   fi
+  log "Using openshift-5-deployment-notes at: $cert_manager_dir"
 
   dry "oc apply -k '$cert_manager_dir/cert-manager/operator/overlays/stable-v1'"
 
