@@ -1,0 +1,33 @@
+---
+# KVM etcd disk tuning — apply at wave 0 before operators install
+# Sets read_ahead_kb=0 on /dev/vda via udev rule to prevent etcd latency
+# spikes on qcow2-backed storage (IBM Cloud KVM, libvirt KVM deployments).
+# Reference: https://github.com/tosin2013/openshift-agent-install/blob/main/hack/tune-etcd-kvm.sh
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kvm-etcd-disk-tuning
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  destination:
+    namespace: openshift-config
+    server: https://kubernetes.default.svc
+  project: default
+  source:
+    path: gitops/cluster-config/kvm-etcd-tuning/base
+    repoURL: https://github.com/tosin2013/agent-gitops-quickstarts.git
+    targetRevision: main
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        maxDuration: 5m0s
+        factor: 2

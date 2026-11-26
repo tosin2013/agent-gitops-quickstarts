@@ -1,0 +1,28 @@
+# kvm-etcd-tuning - MachineConfig for KVM/IBM Cloud deployments
+#
+# Problem: VM disks default to 4096KB read-ahead. etcd does many small random
+# reads — this causes massive I/O amplification on qcow2-backed storage,
+# resulting in 99th percentile read latencies > 1s (observed 4s+ on IBM Cloud KVM).
+#
+# Fix: udev rule sets read_ahead_kb=0 on /dev/vda for all add/change events,
+# winning over kernel defaults and preventing udev from resetting it after boot.
+#
+# Applies to: KVM/qcow2 deployments only. Not needed on bare metal NVMe/SAS.
+# Reference: hack/tune-etcd-kvm.sh in openshift-agent-install
+---
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 98-etcd-disk-tuning-master
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    storage:
+      files:
+        - path: /etc/udev/rules.d/98-etcd-disk-tuning.rules
+          mode: 0644
+          contents:
+            source: "data:text/plain;charset=utf-8,ACTION%3D%3D%22add%7Cchange%22%2C%20KERNEL%3D%3D%22vda%22%2C%20ATTR%7Bqueue%2Fread_ahead_kb%7D%3D%220%22%0A"
