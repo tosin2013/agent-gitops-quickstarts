@@ -1,28 +1,37 @@
-# kvm-etcd-tuning - MachineConfig for KVM/IBM Cloud deployments
-#
-# Problem: VM disks default to 4096KB read-ahead. etcd does many small random
-# reads — this causes massive I/O amplification on qcow2-backed storage,
-# resulting in 99th percentile read latencies > 1s (observed 4s+ on IBM Cloud KVM).
-#
-# Fix: udev rule sets read_ahead_kb=0 on /dev/vda for all add/change events,
-# winning over kernel defaults and preventing udev from resetting it after boot.
-#
-# Applies to: KVM/qcow2 deployments only. Not needed on bare metal NVMe/SAS.
-# Reference: hack/tune-etcd-kvm.sh in openshift-agent-install
----
 apiVersion: machineconfiguration.openshift.io/v1
 kind: MachineConfig
 metadata:
-  name: 98-etcd-disk-tuning-master
   labels:
     machineconfiguration.openshift.io/role: master
+  name: 98-etcd-disk-tuning-master
 spec:
   config:
     ignition:
-      version: 3.4.0
+      version: 3.5.0
     storage:
       files:
-        - path: /etc/udev/rules.d/98-etcd-disk-tuning.rules
-          mode: 0644
-          contents:
-            source: "data:text/plain;charset=utf-8,ACTION%3D%3D%22add%7Cchange%22%2C%20KERNEL%3D%3D%22vda%22%2C%20ATTR%7Bqueue%2Fread_ahead_kb%7D%3D%220%22%0A"
+        - contents:
+            compression: ""
+            source: data:;base64,U1VCU1lTVEVNPT0iYmxvY2siLCBLRVJORUw9PSJ2ZGEiLCBBQ1RJT049PSJhZGR8Y2hhbmdlIiwgQVRUUntxdWV1ZS9yZWFkX2FoZWFkX2tifT0iMCIK
+          mode: 420
+          overwrite: true
+          path: /etc/udev/rules.d/99-etcd-disk-tuning.rules
+    systemd:
+      units:
+        - contents: |
+            [Unit]
+            Description=Set etcd disk read-ahead to 0
+            After=systemd-udev-settle.service
+            Wants=dev-vda.device
+            After=dev-vda.device
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart=/bin/sh -c 'echo 0 > /sys/block/vda/queue/read_ahead_kb'
+            ExecStartPost=/bin/sh -c 'udevadm trigger --attr-match=DEVNAME=/dev/vda'
+
+            [Install]
+            WantedBy=multi-user.target
+          enabled: true
+          name: etcd-disk-tuning.service
